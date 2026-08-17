@@ -716,7 +716,7 @@ body.bubble-minimal .bot .msg-bubble{background:transparent !important;border:2p
 @keyframes msgIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 @keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
 </style>
-<link id="manifest-placeholder" rel="manifest">
+<link id="manifest-placeholder" rel="manifest" href="./manifest.json">
 <link id="apple-touch-placeholder" rel="apple-touch-icon">
 <script>
 (function() {
@@ -725,24 +725,9 @@ body.bubble-minimal .bot .msg-bubble{background:transparent !important;border:2p
 
   // Set apple touch icon
   document.getElementById('apple-touch-placeholder').href = icon512;
-
-  // Build manifest as a Blob URL (accepted by all Chrome versions)
-  var manifest = {
-    name: "Safe Space",
-    short_name: "SafeSpace",
-    description: "Tu lugar seguro, siempre.",
-    start_url: ".",
-    display: "standalone",
-    background_color: "#0d0d1a",
-    theme_color: "#7c6ff7",
-    icons: [
-      { src: icon192, sizes: "192x192", type: "image/png", purpose: "any maskable" },
-      { src: icon512, sizes: "512x512", type: "image/png", purpose: "any maskable" }
-    ]
-  };
-  var blob = new Blob([JSON.stringify(manifest)], {type: "application/manifest+json"});
-  var blobUrl = URL.createObjectURL(blob);
-  document.getElementById('manifest-placeholder').href = blobUrl;
+  // El manifest ya no se genera aquí — vive como archivo real en ./manifest.json
+  // (necesario para que herramientas como Bubblewrap/PWABuilder puedan leerlo
+  // al empaquetar la app para Android/Google Play).
 })();
 </script>
 </head>
@@ -1806,6 +1791,7 @@ const DB = (function(){
   const DB_VERSION = 1;
   const VERSION = '3.0';
   let _db = null;
+  let _idbAvailable = true; // se pone en false si IndexedDB no se puede usar en este navegador
   // In-memory cache so sync reads work everywhere
   let _cache = {};
 
@@ -1813,7 +1799,15 @@ const DB = (function(){
   function openDB(){
     return new Promise(function(resolve, reject){
       if(_db){ resolve(_db); return; }
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      if(typeof indexedDB === 'undefined'){ reject(new Error('IndexedDB no disponible')); return; }
+      let req;
+      try{
+        req = indexedDB.open(DB_NAME, DB_VERSION);
+      }catch(e){
+        // Algunos navegadores (Safari en privado viejo, políticas de empresa)
+        // lanzan el error de forma síncrona en vez de vía onerror.
+        reject(e); return;
+      }
       req.onupgradeneeded = function(e){
         const db = e.target.result;
         ['users','chats','diary','tasks','plant','pomodoro','memory',
@@ -1897,6 +1891,12 @@ const DB = (function(){
   function write(store, key, value){
     if(!_cache[store]) _cache[store]={};
     _cache[store][key] = value;
+    if(!_idbAvailable){
+      // Sin IndexedDB: persistimos directo en localStorage (best-effort).
+      try{ localStorage.setItem('ss_fallback_'+store+'_'+key, JSON.stringify(value)); }
+      catch(e){ warnStorageFailure(); }
+      return true;
+    }
     idbSet(store, key, value).then(function(ok){ // async, pero ahora sí se revisa el resultado
       if(!ok) warnStorageFailure();
     }).catch(function(){
@@ -1906,6 +1906,10 @@ const DB = (function(){
   }
   function del(store, key){
     if(_cache[store]) delete _cache[store][key];
+    if(!_idbAvailable){
+      try{ localStorage.removeItem('ss_fallback_'+store+'_'+key); }catch(e){}
+      return;
+    }
     idbDelete(store, key).catch(function(){ warnStorageFailure(); });
   }
 
@@ -1925,6 +1929,29 @@ const DB = (function(){
       }));
     }).then(function(){
       // Migrate any existing localStorage data (one-time)
+      _migrateFromLocalStorage();
+      _ready = true;
+      _readyCallbacks.forEach(function(cb){ cb(); });
+      _readyCallbacks = [];
+    }).catch(function(err){
+      // IndexedDB no se pudo abrir en absoluto (política del navegador,
+      // modo privado antiguo, etc.). En vez de dejar la app congelada
+      // para siempre esperando una promesa que nunca resuelve, seguimos
+      // en modo memoria + localStorage plano, y avisamos una sola vez.
+      console.error('[DB] IndexedDB no disponible, usando fallback de localStorage', err);
+      _idbAvailable = false;
+      STORES.forEach(function(s){
+        _cache[s] = {};
+        try{
+          for(let i=0;i<localStorage.length;i++){
+            const k = localStorage.key(i);
+            const prefix = 'ss_fallback_'+s+'_';
+            if(k && k.indexOf(prefix) === 0){
+              try{ _cache[s][k.slice(prefix.length)] = JSON.parse(localStorage.getItem(k)); }catch(e){}
+            }
+          }
+        }catch(e){}
+      });
       _migrateFromLocalStorage();
       _ready = true;
       _readyCallbacks.forEach(function(cb){ cb(); });
@@ -2349,6 +2376,8 @@ const LS = {
 
 // ── STATE ──
 function _safeLsGet(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+function _safeSsGet(k){try{return sessionStorage.getItem(k);}catch(e){return null;}}
+function _safeSsSet(k,v){try{sessionStorage.setItem(k,v);}catch(e){}}
 let lang=_safeLsGet('ss_lang')||'es',currentUser=null,currentChatId=null,isTyping=false,selectedMood='';
 
 // ── TRANSLATIONS ──
@@ -2825,6 +2854,11 @@ document.addEventListener('DOMContentLoaded', ()=>{
       try{try{localStorage.removeItem('ss_session_user');}catch(e){}}catch(e){} // clear one-time login key
       enterApp(savedUser);
     }
+  }).catch(function(err){
+    // Red de seguridad final: si algo truena durante el arranque, mostramos
+    // la pantalla de login igual en vez de dejar la app en blanco para siempre.
+    console.error('[Startup] Error inicializando la app', err);
+    try{ showScreen('signin'); }catch(e){}
   });
 });
 function showScreen(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');}
@@ -3396,7 +3430,7 @@ async function sendMessage(){
   }catch(e){
     showTyping(false);
     if(e.message === 'All APIs exhausted' && (Date.now() - lastWorkerWarningTime) > WORKER_WARNING_COOLDOWN_MS){
-      lastWorkerWarningTime = Date.now();
+      markWorkerWarning();
       const busyMsg = lang==='en'
         ? "🤖 The assistant is very busy right now — meanwhile, here's something that might help:"
         : lang==='fr'
@@ -3438,7 +3472,6 @@ const FALLBACK_REPLIES = {
     'Puedes tomarte una pausa si lo necesitas, y seguir cuando quieras. Aquí sigo.',
     'A veces no hay palabras exactas para lo que sentimos, y está bien. ¿Qué es lo que sí puedes poner en palabras ahora?',
     'Lo que sientes tiene sentido, aunque ahora no encuentres por qué. Sigue contándome si quieres.',
-    'No necesitas tener una respuesta perfecta para seguir hablando. Solo dime lo que se te ocurra.',
     'Estoy contigo en esto. ¿Hay algo específico que te gustaría que supiera?',
     'Aquí sigo, leyendo lo que me compartes.',
     'Puedes seguir cuando quieras, no hay ninguna prisa.',
@@ -3450,30 +3483,77 @@ const FALLBACK_REPLIES = {
     'Aquí no hay juicio, solo espacio para que digas lo que sientas.',
     'Puedes empezar por donde quieras, no tiene que ser en orden.',
     'Me importa lo que me estás contando, aunque no tenga la respuesta perfecta.',
-    'No tienes que minimizar lo que sientes para que valga la pena compartirlo.',
     'Sigue, si quieres. O quédate en silencio un momento, también está bien.',
     'Cada cosa que compartes aquí cuenta, por pequeña que parezca.',
     'No busco arreglarte, solo acompañarte mientras lo procesas.',
     'Puedes repetir lo mismo varias veces si necesitas decirlo de nuevo.',
     'Este es un espacio para ti, sin prisa y sin exigencias.',
     'Lo que sea que estés cargando, gracias por compartir aunque sea un poco.',
-    'No necesitas saber qué viene después para seguir hablando ahora.',
     'Aquí puedes ser honesto/a sin preocuparte por cómo suena.',
     'Sigo aquí, pase lo que pase con lo que me cuentes.',
-    'No tienes que tener todas las palabras correctas, solo las tuyas.',
     'Puedes confiar en que esto se queda entre nosotros, en este espacio.',
     'A veces ayuda simplemente saber que alguien más lo sabe, aunque sea así.',
     'No hay una cantidad correcta de veces para hablar de lo mismo.',
     'Puedes parar cuando quieras, y seguir cuando estés listo/a.',
     'Está bien si esto no tiene una solución clara todavía.',
-    'No necesitas venir aquí con todo resuelto. Puedes venir así, como estás ahora.',
     'Gracias por confiar este momento conmigo.',
     'Puedes hablar de lo que sea, no solo de lo que crees que \'debería\' importar.',
-    'No tienes que sonar coherente para que esto valga la pena.',
     'Aquí no hay una versión equivocada de ti mismo/a.',
     'Puedes contarme tanto o tan poco como quieras.',
     'Lo que compartes se queda aquí, sin juzgarte por ello.',
     'Sigo contigo, en esto y en lo que sigue.',
+    'Puedes ir tan despacio como necesites. Aquí no hay cronómetro.',
+    'Respira un segundo si lo necesitas. Sigo aquí cuando quieras continuar.',
+    'Estoy leyendo cada palabra que escribes, con calma.',
+    '¿Qué parte de esto te gustaría contarme primero?',
+    'Un paso a la vez. No hace falta verlo todo de una sola vez.',
+    'Esto que sientes es válido, punto.',
+    'No estás exagerando. Lo que sientes es real.',
+    'Puedo quedarme en silencio contigo un momento, si eso ayuda más que hablar.',
+    '¿Hay algo de tu día que se sintió un poco más liviano, aunque sea chiquito?',
+    'Gracias por quedarte aquí, contándome esto.',
+    'No necesitas convencerme de que esto es real. Ya te creo.',
+    'A veces las palabras llegan después. Por ahora, con lo que tienes basta.',
+    '¿Qué es lo primero que notas en tu cuerpo cuando piensas en esto?',
+    'Está bien no saber por qué te sientes así todavía.',
+    'Puedes escribirlo como fragmentos, no tiene que ser un párrafo entero.',
+    'Te creo, y me importa lo que me estás contando.',
+    'A veces ayuda nombrar solo una cosa a la vez. ¿Cuál sería la primera?',
+    'No hay nada que tengas que arreglar en este momento, solo contar.',
+    'Puedo notar que esto no es fácil de poner en palabras. Tómate el tiempo que necesites.',
+    'Sigo aquí, aunque el mensaje sea corto o largo, da igual.',
+    '¿Te gustaría contarme más, o prefieres que solo te acompañe un rato en silencio?',
+    'Cada quien procesa distinto. Lo que haces ahora, hablar de esto, ya es algo.',
+    'No busco la versión ordenada de esto. Cuéntamelo como te salga.',
+    'Estoy aquí para escuchar, no para juzgar ni corregir.',
+    'Puedes contarme lo que sea, aunque parezca que no tiene mucho sentido.',
+    'No hay nada que tengas que resolver ahora mismo. Solo estamos hablando.',
+    '¿Cómo te sientes en este momento, aquí, hablando de esto?',
+    'Puedes tomarte una pausa y volver cuando quieras. Sigo aquí.',
+    'Está bien si esto no tiene un final claro todavía.',
+    'Te escucho, aunque no tenga una respuesta perfecta para darte.',
+    '¿Qué necesitas ahora mismo, aunque sea algo pequeño?',
+    'No tienes que cargar esto solo/a. Aquí estoy.',
+    'Puedes repetir lo mismo las veces que necesites. No me molesta.',
+    'Cada mensaje que me mandas importa, sin importar el tamaño.',
+    '¿Hay alguien más con quien te sientas cómodo/a hablando de esto también?',
+    'No busco arreglarte. Solo quiero entender cómo te sientes.',
+    'Tómate tu tiempo. No hay ninguna prisa aquí.',
+    'Puedo quedarme aquí contigo mientras ordenas tus pensamientos.',
+    '¿Qué es lo que más pesa ahora mismo?',
+    'Está bien contradecirte, cambiar de opinión sobre cómo te sientes.',
+    'No necesitas una razón grande para sentirte así.',
+    'Puedes escribirlo de la forma que te salga más natural.',
+    'Te agradezco que sigas aquí, contándome esto.',
+    '¿Te ayudaría si simplemente te acompaño en silencio un rato?',
+    'No tienes que tener claridad todavía. Podemos ir descubriéndolo juntos.',
+    'Aquí no hay reloj corriendo. Habla cuando quieras.',
+    'Puedo notar que te importa esto. Eso ya dice mucho.',
+    'Está bien sentir varias cosas a la vez, aunque no tengan sentido juntas.',
+    '¿Qué te gustaría que pasara después de contarme esto?',
+    'No necesitas disculparte por sentir lo que sientes.',
+    'Sigo leyendo, sigo aquí, tómate el tiempo que necesites.',
+    'Gracias por darle espacio a esto, aunque sea difícil.',
   ],
   en: [
     'Thank you for sharing that with me. Tell me a bit more — I want to understand how you\'re feeling.',
@@ -3494,7 +3574,6 @@ const FALLBACK_REPLIES = {
     'You can pause if you need to, and continue whenever you like. I\'m still here.',
     'Sometimes there aren\'t exact words for what we feel, and that\'s okay. What can you put into words right now?',
     'What you\'re feeling makes sense, even if you can\'t pinpoint why right now. Keep telling me if you want.',
-    'You don\'t need a perfect answer to keep talking. Just say whatever comes to mind.',
     'I\'m with you in this. Is there something specific you\'d like me to know?',
     'I\'m still here, reading what you share with me.',
     'You can continue whenever you like, there\'s no rush at all.',
@@ -3506,30 +3585,77 @@ const FALLBACK_REPLIES = {
     'There\'s no judgment here, just space for you to say how you feel.',
     'You can start wherever you want, it doesn\'t have to be in order.',
     'What you\'re telling me matters, even without a perfect answer from me.',
-    'You don\'t have to downplay what you feel for it to be worth sharing.',
     'Keep going, if you want. Or stay quiet for a moment, that\'s okay too.',
     'Everything you share here matters, no matter how small it seems.',
     'I\'m not trying to fix you, just to be here while you process it.',
     'You can repeat the same thing more than once if you need to say it again.',
     'This is a space for you, no rush and no expectations.',
     'Whatever you\'re carrying, thank you for sharing even a little of it.',
-    'You don\'t need to know what comes next to keep talking now.',
     'You can be honest here without worrying about how it sounds.',
     'I\'m still here, no matter what you tell me.',
-    'You don\'t need all the right words, just your own.',
     'You can trust that this stays between us, in this space.',
     'Sometimes it helps just to know someone else knows, even like this.',
     'There\'s no right number of times to talk about the same thing.',
     'You can stop whenever you want, and continue whenever you\'re ready.',
     'It\'s okay if this doesn\'t have a clear solution yet.',
-    'You don\'t need to come here with everything figured out. You can come as you are right now.',
     'Thank you for trusting me with this moment.',
     'You can talk about anything, not just what you think \'should\' matter.',
-    'You don\'t have to sound coherent for this to be worth it.',
     'There\'s no wrong version of yourself here.',
     'You can tell me as much or as little as you want.',
     'What you share stays here, without judgment.',
     'I\'m still with you, in this and whatever comes next.',
+    'You can go as slowly as you need. There\'s no timer here.',
+    'Take a second to breathe if you need to. I\'m here whenever you\'re ready to continue.',
+    'I\'m reading every word you write, taking my time.',
+    'Which part of this would you like to tell me first?',
+    'One step at a time. You don\'t have to see the whole picture at once.',
+    'What you\'re feeling is valid, period.',
+    'You\'re not overreacting. What you feel is real.',
+    'I can just sit with you in silence for a moment, if that helps more than talking.',
+    'Was there any part of your day that felt a little lighter, even a small one?',
+    'Thank you for staying here, telling me this.',
+    'You don\'t need to convince me this is real. I already believe you.',
+    'Sometimes the words come later. For now, what you have is enough.',
+    'What\'s the first thing you notice in your body when you think about this?',
+    'It\'s okay not to know why you feel this way yet.',
+    'You can write it in fragments, it doesn\'t have to be a full paragraph.',
+    'I believe you, and what you\'re telling me matters to me.',
+    'Sometimes it helps to name just one thing at a time. What would be the first?',
+    'There\'s nothing you need to fix right now, just share.',
+    'I can tell this isn\'t easy to put into words. Take whatever time you need.',
+    'I\'m still here, whether the message is short or long, it doesn\'t matter.',
+    'Would you like to tell me more, or would you rather I just sit with you quietly for a bit?',
+    'Everyone processes things differently. What you\'re doing right now, talking about this, already matters.',
+    'I\'m not looking for the neat version of this. Tell me however it comes out.',
+    'I\'m here to listen, not to judge or correct.',
+    'You can tell me anything, even if it feels like it doesn\'t make much sense.',
+    'There\'s nothing you need to solve right now. We\'re just talking.',
+    'How are you feeling right now, here, talking about this?',
+    'You can take a break and come back whenever you want. I\'ll still be here.',
+    'It\'s okay if this doesn\'t have a clear ending yet.',
+    'I\'m listening, even if I don\'t have a perfect answer for you.',
+    'What do you need right now, even something small?',
+    'You don\'t have to carry this alone. I\'m here.',
+    'You can repeat the same thing as many times as you need. It doesn\'t bother me.',
+    'Every message you send matters, no matter how small.',
+    'Is there anyone else you feel comfortable talking to about this too?',
+    'I\'m not trying to fix you. I just want to understand how you feel.',
+    'Take your time. There\'s no rush here.',
+    'I can stay here with you while you sort through your thoughts.',
+    'What\'s weighing on you the most right now?',
+    'It\'s okay to contradict yourself, to change how you feel about this.',
+    'You don\'t need a big reason to feel this way.',
+    'You can write it however feels most natural to you.',
+    'I appreciate you staying here, telling me this.',
+    'Would it help if I just stayed with you quietly for a while?',
+    'You don\'t need clarity yet. We can figure it out together.',
+    'There\'s no clock running here. Talk whenever you want.',
+    'I can tell this matters to you. That already says a lot.',
+    'It\'s okay to feel several things at once, even if they don\'t fit together.',
+    'What would you like to happen after telling me this?',
+    'You don\'t need to apologize for feeling what you feel.',
+    'I\'m still reading, still here, take whatever time you need.',
+    'Thank you for giving this space, even though it\'s hard.',
   ],
   fr: [
     'Merci de partager ça avec moi. Raconte-moi un peu plus — je veux comprendre comment tu te sens.',
@@ -3550,7 +3676,6 @@ const FALLBACK_REPLIES = {
     'Tu peux faire une pause si tu en as besoin, et continuer quand tu veux. Je suis toujours là.',
     'Parfois il n\'y a pas de mots exacts pour ce qu\'on ressent, et c\'est normal. Qu\'est-ce que tu arrives à mettre en mots là ?',
     'Ce que tu ressens a du sens, même si tu ne sais pas encore pourquoi. Continue si tu veux.',
-    'Tu n\'as pas besoin d\'une réponse parfaite pour continuer à parler. Dis juste ce qui te vient.',
     'Je suis avec toi dans tout ça. Y a-t-il quelque chose de précis que tu aimerais que je sache ?',
     'Je suis toujours là, en train de lire ce que tu partages.',
     'Tu peux continuer quand tu veux, il n\'y a aucune urgence.',
@@ -3562,30 +3687,77 @@ const FALLBACK_REPLIES = {
     'Il n\'y a pas de jugement ici, juste de l\'espace pour dire ce que tu ressens.',
     'Tu peux commencer où tu veux, ça n\'a pas besoin d\'être dans l\'ordre.',
     'Ce que tu me racontes compte, même sans réponse parfaite de ma part.',
-    'Tu n\'as pas à minimiser ce que tu ressens pour que ça vaille la peine d\'être partagé.',
     'Continue, si tu veux. Ou reste silencieux(se) un moment, c\'est bien aussi.',
     'Tout ce que tu partages ici compte, aussi petit que ça puisse paraître.',
     'Je n\'essaie pas de te réparer, juste d\'être là pendant que tu traites ça.',
     'Tu peux répéter la même chose plusieurs fois si tu as besoin de le redire.',
     'C\'est un espace pour toi, sans urgence et sans attentes.',
     'Quoi que tu portes, merci de partager ne serait-ce qu\'un peu.',
-    'Tu n\'as pas besoin de savoir ce qui vient après pour continuer à parler maintenant.',
     'Tu peux être honnête ici sans t\'inquiéter de comment ça sonne.',
     'Je suis toujours là, peu importe ce que tu me racontes.',
-    'Tu n\'as pas besoin de tous les bons mots, juste des tiens.',
     'Tu peux faire confiance que ça reste entre nous, dans cet espace.',
     'Parfois ça aide juste de savoir que quelqu\'un d\'autre le sait, même comme ça.',
     'Il n\'y a pas de bon nombre de fois pour parler de la même chose.',
     'Tu peux t\'arrêter quand tu veux, et continuer quand tu es prêt(e).',
     'C\'est normal si ça n\'a pas encore de solution claire.',
-    'Tu n\'as pas besoin de venir ici avec tout résolu. Tu peux venir comme tu es maintenant.',
     'Merci de me confier ce moment.',
     'Tu peux parler de tout, pas seulement de ce que tu penses qui \'devrait\' compter.',
-    'Tu n\'as pas besoin de sembler cohérent(e) pour que ça en vaille la peine.',
     'Il n\'y a pas de mauvaise version de toi ici.',
     'Tu peux m\'en dire autant ou aussi peu que tu veux.',
     'Ce que tu partages reste ici, sans jugement.',
     'Je reste avec toi, dans ça et dans ce qui suit.',
+    'Tu peux avancer aussi lentement que tu en as besoin. Il n\'y a pas de chronomètre ici.',
+    'Prends une seconde pour respirer si tu en as besoin. Je suis là quand tu voudras continuer.',
+    'Je lis chaque mot que tu écris, tranquillement.',
+    'Quelle partie de tout ça aimerais-tu me raconter en premier ?',
+    'Un pas à la fois. Tu n\'as pas besoin de tout voir d\'un coup.',
+    'Ce que tu ressens est valable, point final.',
+    'Tu n\'exagères pas. Ce que tu ressens est réel.',
+    'Je peux juste rester en silence avec toi un moment, si ça aide plus que parler.',
+    'Y a-t-il eu un moment de ta journée qui a semblé un peu plus léger, même petit ?',
+    'Merci de rester ici, à me raconter ça.',
+    'Tu n\'as pas besoin de me convaincre que c\'est réel. Je te crois déjà.',
+    'Parfois les mots viennent plus tard. Pour l\'instant, ce que tu as suffit.',
+    'Qu\'est-ce que tu remarques en premier dans ton corps quand tu penses à ça ?',
+    'C\'est normal de ne pas encore savoir pourquoi tu te sens comme ça.',
+    'Tu peux l\'écrire par fragments, ça n\'a pas besoin d\'être un paragraphe entier.',
+    'Je te crois, et ce que tu me racontes compte pour moi.',
+    'Parfois ça aide de nommer une seule chose à la fois. Laquelle serait la première ?',
+    'Il n\'y a rien à réparer maintenant, juste à raconter.',
+    'Je sens que ce n\'est pas facile à mettre en mots. Prends tout le temps qu\'il te faut.',
+    'Je suis toujours là, que le message soit court ou long, peu importe.',
+    'Tu voudrais m\'en dire plus, ou préfères-tu que je reste juste avec toi en silence un moment ?',
+    'Chacun traite les choses différemment. Ce que tu fais là, en parler, ça compte déjà.',
+    'Je ne cherche pas la version bien rangée de tout ça. Raconte-moi comme ça vient.',
+    'Je suis là pour écouter, pas pour juger ni corriger.',
+    'Tu peux tout me dire, même si ça te semble ne pas avoir beaucoup de sens.',
+    'Il n\'y a rien que tu doives résoudre maintenant. On parle, c\'est tout.',
+    'Comment te sens-tu en ce moment, ici, en parlant de ça ?',
+    'Tu peux faire une pause et revenir quand tu veux. Je reste là.',
+    'C\'est normal si ça n\'a pas encore de fin claire.',
+    'Je t\'écoute, même si je n\'ai pas de réponse parfaite à te donner.',
+    'De quoi as-tu besoin maintenant, même quelque chose de petit ?',
+    'Tu n\'as pas à porter ça seul(e). Je suis là.',
+    'Tu peux répéter la même chose autant de fois que tu en as besoin. Ça ne me dérange pas.',
+    'Chaque message que tu m\'envoies compte, peu importe sa taille.',
+    'Y a-t-il quelqu\'un d\'autre avec qui tu te sens à l\'aise d\'en parler aussi ?',
+    'Je ne cherche pas à te réparer. Je veux juste comprendre ce que tu ressens.',
+    'Prends ton temps. Il n\'y a aucune urgence ici.',
+    'Je peux rester ici avec toi pendant que tu mets de l\'ordre dans tes pensées.',
+    'Qu\'est-ce qui pèse le plus en ce moment ?',
+    'C\'est normal de te contredire, de changer d\'avis sur ce que tu ressens.',
+    'Tu n\'as pas besoin d\'une grande raison pour te sentir comme ça.',
+    'Tu peux l\'écrire de la façon qui te semble la plus naturelle.',
+    'Je te remercie de rester ici, à me raconter ça.',
+    'Ça t\'aiderait si je restais juste avec toi en silence un moment ?',
+    'Tu n\'as pas besoin d\'y voir clair tout de suite. On peut avancer ensemble.',
+    'Il n\'y a pas d\'horloge qui tourne ici. Parle quand tu veux.',
+    'Je sens que ça compte pour toi. Ça en dit déjà beaucoup.',
+    'C\'est normal de ressentir plusieurs choses à la fois, même si elles ne s\'accordent pas.',
+    'Qu\'aimerais-tu qu\'il se passe après m\'avoir raconté ça ?',
+    'Tu n\'as pas à t\'excuser de ressentir ce que tu ressens.',
+    'Je continue à lire, je reste là, prends tout le temps qu\'il te faut.',
+    'Merci de donner de la place à ça, même si c\'est difficile.',
   ],
 };
 
@@ -4533,8 +4705,9 @@ function detectFallbackCategory(text){
   return null;
 }
 
-// Evita repetir la misma frase 2 veces seguidas dentro de la misma sesion
-let lastFallbackIdx = -1;
+// Evita repetir la misma frase 2 veces seguidas, incluso si se recarga la
+// pagina (session storage sobrevive un F5, se limpia al cerrar la pestana).
+let lastFallbackIdx = _safeSsGet('ss_last_fallback_reply') || -1;
 function getFallbackReply(userText){
   const generalPool = FALLBACK_REPLIES[lang] || FALLBACK_REPLIES.es;
   const category = detectFallbackCategory(userText);
@@ -4549,6 +4722,7 @@ function getFallbackReply(userText){
     while(pool[idx] === lastFallbackIdx && tries < 10){ idx = Math.floor(Math.random()*pool.length); tries++; }
   }
   lastFallbackIdx = pool[idx];
+  _safeSsSet('ss_last_fallback_reply', lastFallbackIdx);
   return pool[idx];
 }
 
@@ -4638,10 +4812,13 @@ function buildConversationContext(msgs){
 // Recuerda la última vez que las 4 IAs fallaron a la vez (Worker agotado/caído),
 // y la última vez que se avisó de eso al usuario — para no insistir con una
 // segunda vuelta inútil, ni bombardear con el mismo aviso una y otra vez.
-let lastWorkerFailureTime = 0;
-let lastWorkerWarningTime = 0;
+// Guardado en sessionStorage para que sobreviva un F5 (se limpia al cerrar la pestaña).
+let lastWorkerFailureTime = parseInt(_safeSsGet('ss_last_worker_failure'), 10) || 0;
+let lastWorkerWarningTime = parseInt(_safeSsGet('ss_last_worker_warning'), 10) || 0;
 const WORKER_FAILURE_COOLDOWN_MS = 2 * 60 * 1000;   // 2 minutos
 const WORKER_WARNING_COOLDOWN_MS = 5 * 60 * 1000;   // 5 minutos
+function markWorkerFailure(){ lastWorkerFailureTime = Date.now(); _safeSsSet('ss_last_worker_failure', String(lastWorkerFailureTime)); }
+function markWorkerWarning(){ lastWorkerWarningTime = Date.now(); _safeSsSet('ss_last_worker_warning', String(lastWorkerWarningTime)); }
 
 async function callAI(msgs,attempt=0,lap=1){
   if(!navigator.onLine){
@@ -4656,7 +4833,7 @@ async function callAI(msgs,attempt=0,lap=1){
       if(recentlyFailed){
         // Las 4 ya fallaron hace poco — muy probable que sigan igual.
         // Nos ahorramos 4 llamadas mas al Worker que ya viene fallando.
-        lastWorkerFailureTime = Date.now();
+        markWorkerFailure();
         throw new Error('All APIs exhausted');
       }
       // Primera vuelta completa fallo por todas las APIs. Puede ser un pico
@@ -4665,7 +4842,7 @@ async function callAI(msgs,attempt=0,lap=1){
       await new Promise(function(resolve){ setTimeout(resolve, 2500); });
       return callAI(msgs, 0, 2);
     }
-    lastWorkerFailureTime = Date.now();
+    markWorkerFailure();
     throw new Error('All APIs exhausted');
   }
   const api=APIS[currentApiIdx];
@@ -5193,17 +5370,67 @@ function downloadClinicalReport(){
 }
 
 // -- CRISIS DETECTION --
+// Frases completas (no palabras sueltas ambiguas) para evitar falsos positivos
+// con modismos comunes: "matar el tiempo", "morirse de risa/hambre/aburrimiento".
+// Cobertura balanceada entre es/en/fr.
 const CRISIS_KEYWORDS = [
-  'suicid','matar','morir','no quiero vivir','quitarme la vida','acabar con todo',
-  'no vale la pena vivir','mejor muerto','mejor sin mi','ya no quiero estar',
-  'hacerme dano','cortarme','lastimarme','autolesion','kill myself','suicide',
-  'want to die','end my life','hurt myself','self harm','no reason to live',
-  'me tuer','mourir','plus envie de vivre'
+  // Español
+  'suicid','quitarme la vida','acabar con mi vida','acabar con todo',
+  'terminar con mi vida','terminar con todo','no quiero vivir','no quiero seguir viviendo',
+  'no quiero seguir aqui','no quiero estar aqui','no quiero existir','quiero dejar de existir',
+  'quiero desaparecer','no vale la pena vivir','no tiene sentido seguir viviendo',
+  'mejor muerto','mejor estaria muerto','mejor sin mi','estarian mejor sin mi',
+  'ya no quiero estar','nadie me extranaria','no aguanto mas',
+  'quiero morir','me quiero morir','prefiero morir','deseo morir','quiero morirme',
+  'me voy a matar','quiero matarme','me quiero matar','matarme',
+  'hacerme dano','quiero hacerme dano','cortarme','lastimarme','autolesion','autolesionarme',
+  // English
+  'suicide','kill myself','want to die','end my life','ending it all','ending my life',
+  'no reason to live','no point in living','not worth living','better off dead',
+  'dont want to be here anymore','dont want to exist','want to disappear',
+  'cant go on','cant do this anymore','nobody would miss me','no one would miss me',
+  'planning to kill myself','thinking about suicide','thinking about killing myself',
+  'hurt myself','want to hurt myself','self harm','cutting myself',
+  // Français
+  'me suicider','me tuer','je veux me tuer','en finir avec ma vie','en finir avec tout',
+  'je veux mourir','jai envie de mourir','envie de mourir','mieux vaut que je meure',
+  'je ne veux plus vivre','je ne veux plus exister','je veux disparaitre',
+  'plus envie de vivre','plus la force de vivre','plus aucune raison de vivre',
+  'personne ne me manquerait','je veux en finir',
+  'me faire du mal','me couper','mautomutiler','envie de me blesser',
 ];
 
+// Normaliza conservando espacios como límites de palabra (a diferencia de
+// normalizeForFilter, que los elimina — eso permitía falsos positivos al
+// pegar palabras de mensajes distintos, ej. "clima tarda" -> "matar").
+function normalizeForCrisis(str){
+  let s = str.toLowerCase();
+  s = s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  s = s.replace(/[04135@78]/g, function(ch){
+    return {'0':'o','4':'a','1':'i','3':'e','5':'s','7':'t','@':'a','8':'b'}[ch] || ch;
+  });
+  s = s.replace(/[^a-z\s]/g,' ');
+  s = s.replace(/(.)\1+/g, '$1');
+  s = s.replace(/\s+/g,' ').trim();
+  return s;
+}
+
 function detectCrisis(text){
-  const normalized = normalizeForFilter(text);
-  return CRISIS_KEYWORDS.some(function(kw){ return normalized.indexOf(normalizeForFilter(kw)) >= 0; });
+  const normalized = normalizeForCrisis(text);
+  const tokens = normalized ? normalized.split(' ') : [];
+  return CRISIS_KEYWORDS.some(function(kw){
+    const nk = normalizeForCrisis(kw);
+    if(!nk) return false;
+    if(nk.indexOf(' ') === -1){
+      // Keyword de una sola palabra (ej. "suicid"): coincide si algún token
+      // EMPIEZA con ella, para cubrir variantes como "suicidio"/"suicida"/
+      // "suicidarme" sin pegarse a la palabra de al lado.
+      return tokens.some(function(tok){ return tok.indexOf(nk) === 0; });
+    }
+    // Frase de varias palabras: debe aparecer completa, delimitada por
+    // espacios (no como substring cruzando dos palabras distintas).
+    return (' ' + normalized + ' ').indexOf(' ' + nk + ' ') >= 0;
+  });
 }
 
 function getCrisisResponse(){
